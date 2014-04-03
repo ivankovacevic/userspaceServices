@@ -1,0 +1,181 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides:          userspaceServices
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Should-Start:      $all
+# Should-Stop:       $all
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Userspace services launcher
+# Description:       Launches services(executable files) of individual users on the system
+#                    by looking at their .startUp, .shutDown and .status directories in
+#                    their home directory, and executing all files that have an x flag
+#                    set. If those directories do not exist they are created. Only users
+#                    with uid equal or greater then 1000 are considered, including as special
+#                    case the root user with uid 0 and excluding as another special case
+#                    the nobody user who has uid 65534.
+### END INIT INFO
+
+# Author: Ivan Kovacevic <ivan.kovacevic@gmail.com>
+
+
+# PATH should only include /usr/* if it runs after the mountnfs.sh script
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+DESC="userspace services launcher"
+NAME="userspaceServices"
+SCRIPTNAME=/etc/init.d/$NAME
+LOCKFILE=/var/run/$NAME.lock
+STARTUPDIR=".startUp"
+SHUTDOWNDIR=".shutDown"
+STATUSDIR=".status"
+
+# Load the VERBOSE setting and other rcS variables
+. /lib/init/vars.sh
+
+# Define LSB log_* functions.
+# Depend on lsb-base (>= 3.2-14) to ensure that this file is present
+# and status_of_proc is working.
+. /lib/lsb/init-functions
+
+launchUserServices ()
+{
+	for file in "$servicesDir"/*
+	do
+		if [ -f "$file" ] && [ -x "$file" ]
+		then
+			# Depending on the file extension the script/service will either be
+			# started in the background or foreground. And if there is no file
+			# extension then it will be started in default mode for corresponding
+			# action/directory.
+			case "$file" in
+			*.foreground)
+				logger -t "$NAME" "Launching $file in foreground for user $username"
+				su $username -c "$file"
+				;;
+			*.background)
+				logger -t "$NAME" "Launching $file in background for user $username"
+				su $username -c "nohup $file >/dev/null 2>&1 &"
+				;;
+			*)
+				if [ "$dedicatedDirectory" == "$STARTUPDIR" ]
+				then
+					logger -t "$NAME" "Launching $file in default mode(background) for user $username"
+					su $username -c "nohup $file >/dev/null 2>&1 &"
+				elif [ "$dedicatedDirectory" == "$SHUTDOWNDIR" ] || [ "$dedicatedDirectory" == "$STATUSDIR" ]
+				then
+					logger -t "$NAME" "Launching $file in default mode(foreground) for user $username"
+					su $username -c "$file"
+				fi
+				;;
+			esac
+		fi
+	done
+}
+
+launchAll ()
+{
+	getent passwd | while read userInfoUnparsed
+	do
+		IFS=':'	read -a userInfo <<<"$userInfoUnparsed"
+
+		username="${userInfo[0]}"
+		userID="${userInfo[2]}"
+		homeDir="${userInfo[5]}"
+		servicesDir="$homeDir/$dedicatedDirectory"
+
+		if [ $userID -eq 0 -o $userID -ge 1000 ] && [ $userID -ne 65534 ]
+		then
+			cd "$homeDir"
+			# Lets try to create the missing directories, but only if they don't already exist.
+			# Because for example some user may already have a file with the same name. In which
+			# case for that user the launching capabilities will simply not work. However there
+			# is a problem if that user has a directory with the same name, which can contain
+			# executable files that the user did not think would be executed on system start or
+			# shutdown. So these directory names should be choosen unique enough or this script
+			# should be upgraded with additional logic to cope with that case... <--- READ THIS
+
+			if [ ! -e "$STARTUPDIR" ]
+			then
+				logger -t "$NAME" "Creating missing $STARTUPDIR for user $username"
+				su $username -c "mkdir $STARTUPDIR"
+			fi
+
+			if [ ! -e "$SHUTDOWNDIR" ]
+			then
+				logger -t "$NAME" "Creating missing $SHUTDOWNDIR for user $username"
+				su $username -c "mkdir $SHUTDOWNDIR"
+			fi
+
+			if [ ! -e "$STATUSDIR" ]
+			then
+				logger -t "$NAME" "Creating missing $STATUSDIR for user $username"
+				su $username -c "mkdir $STATUSDIR"
+			fi
+
+
+			# Now lets check if there are some files that can be executed in the corresponding
+			# directory(dedicated directory) for action that called this function.
+			if [ -d "$servicesDir" ]
+			then
+				if [ "$dedicatedDirectory" == "$STATUSDIR" ]
+				then
+					launchUserServices # Run synchronously. So that status outputs of individual users don't get mixed up.
+				else
+					launchUserServices & # Run asynchronously. Services of individual users run independently of each other.
+				fi
+			fi
+		fi
+	done
+}
+
+
+case "$1" in
+  start)
+	log_daemon_msg "Starting $DESC" "$NAME"
+	if [ ! -e "$LOCKFILE" ]
+	then
+		touch "$LOCKFILE"
+		dedicatedDirectory="$STARTUPDIR"
+		launchAll
+	fi
+
+	log_end_msg 0
+	;;
+  stop)
+	log_daemon_msg "Stopping $DESC" "$NAME"
+	if [ -e "$LOCKFILE" ]
+	then
+		dedicatedDirectory="$SHUTDOWNDIR"
+		launchAll
+		rm -rf "$LOCKFILE"
+	fi
+
+	log_end_msg 0
+	;;
+  status)
+	if [ -e "$LOCKFILE" ]
+	then
+		log_success_msg "Services have been started. Running status scripts."
+	else
+		log_success_msg "Services have been stopped! Running status scripts."
+	fi
+
+	dedicatedDirectory="$STATUSDIR"
+	launchAll
+	log_success_msg "Status check completed"
+	;;
+  restart|force-reload)
+	log_daemon_msg "Restarting $DESC" "$NAME"
+	log_end_msg 0
+	$0 stop
+	$0 start
+	;;
+  *)
+	echo "Usage: $SCRIPTNAME {start|stop|status|restart|force-reload}" >&2
+	exit 3
+	;;
+esac
+
+exit 0
+
